@@ -6,7 +6,7 @@ from contextlib import asynccontextmanager, suppress
 from typing import Optional
 
 from asynch.connection import Connection
-from asynch.errors import AsynchPoolError
+from asynch.errors import AsynchPoolError, OperationalError
 from asynch.proto import constants
 from asynch.proto.models.enums import PoolStatus
 
@@ -33,6 +33,8 @@ class Pool:
         self._lock = asyncio.Lock()
         self._fill_lock = asyncio.Lock()
         self._connection_reservations: set[object] = set()
+        self._pending_acquisitions: set[asyncio.Future] = set()
+        self._startup_waiter: Optional[asyncio.Future] = None
         self._acquired_connections: deque[Connection] = deque(maxlen=maxsize)
         self._free_connections: deque[Connection] = deque(maxlen=maxsize)
         self._opened: bool = False
@@ -133,6 +135,31 @@ class Pool:
     @property
     def minsize(self) -> int:
         return self._minsize
+
+    async def _begin_acquisition(self) -> asyncio.Future:
+        while True:
+            async with self._lock:
+                if self._closed:
+                    raise AsynchPoolError(f"{self} is closed")
+                if self._startup_waiter is None:
+                    done = asyncio.get_running_loop().create_future()
+                    self._pending_acquisitions.add(done)
+                    return done
+                startup_waiter = self._startup_waiter
+            await asyncio.shield(startup_waiter)
+
+    async def _finish_acquisition(self, done: asyncio.Future) -> None:
+        async with self._lock:
+            self._pending_acquisitions.discard(done)
+            if not done.done():
+                done.set_result(None)
+
+    async def _restore_minsize(self) -> None:
+        async with self._lock:
+            should_fill = self._opened and not self._closed
+        if should_fill:
+            with suppress(Exception):
+                await self._ensure_minsize_connections(strict=True)
 
     async def _close_connection(self, conn: Connection) -> None:
         with suppress(Exception):
@@ -239,7 +266,13 @@ class Pool:
             except asyncio.CancelledError:
                 await self._discard_acquired_connection(conn)
                 raise
-            except (ConnectionError, RuntimeError):
+            except (
+                ConnectionError,
+                OSError,
+                asyncio.TimeoutError,
+                RuntimeError,
+                OperationalError,
+            ):
                 await self._discard_acquired_connection(conn)
                 continue
             except Exception:
@@ -252,28 +285,38 @@ class Pool:
             raise AsynchPoolError(f"{self} was closed while acquiring a connection")
 
     async def _acquire_connection(self) -> Connection:
-        if conn := await self._get_fresh_connection():
-            return conn
-
-        reservation = (await self._reserve_connection_creations(1))[0]
-        conn = None
+        done = await self._begin_acquisition()
+        failed = False
         try:
-            conn = await self._open_connection()
-            if await self._store_connection(conn, reservation, self._acquired_connections):
+            if conn := await self._get_fresh_connection():
                 return conn
-        except asyncio.CancelledError:
-            await self._cancel_connection_creation(reservation, conn)
-            if conn:
-                await self._close_connection(conn)
-            raise
-        except Exception:
-            await self._cancel_connection_creation(reservation, conn)
-            if conn:
-                await self._close_connection(conn)
-            raise
 
-        await self._close_connection(conn)
-        raise AsynchPoolError(f"{self} was closed while creating a connection")
+            reservation = (await self._reserve_connection_creations(1))[0]
+            conn = None
+            try:
+                conn = await self._open_connection()
+                if await self._store_connection(conn, reservation, self._acquired_connections):
+                    return conn
+            except asyncio.CancelledError:
+                await self._cancel_connection_creation(reservation, conn)
+                if conn:
+                    await self._close_connection(conn)
+                raise
+            except Exception:
+                await self._cancel_connection_creation(reservation, conn)
+                if conn:
+                    await self._close_connection(conn)
+                raise
+
+            await self._close_connection(conn)
+            raise AsynchPoolError(f"{self} was closed while creating a connection")
+        except BaseException:
+            failed = True
+            raise
+        finally:
+            await self._finish_acquisition(done)
+            if failed:
+                await self._restore_minsize()
 
     async def _release_connection(self, conn: Connection) -> None:
         async with self._lock:
@@ -333,6 +376,8 @@ class Pool:
         self._lock = asyncio.Lock()
         self._fill_lock = asyncio.Lock()
         self._connection_reservations.clear()
+        self._pending_acquisitions.clear()
+        self._startup_waiter = None
         self._free_connections.clear()
         self._acquired_connections.clear()
         self._opened = False
@@ -356,9 +401,6 @@ class Pool:
             self._reset_for_new_loop()
 
         async with self._sem:
-            async with self._lock:
-                if self._closed:
-                    raise AsynchPoolError(f"{self} is closed")
             conn = await self._acquire_connection()
             try:
                 yield conn
@@ -388,14 +430,27 @@ class Pool:
             async with self._lock:
                 if self._opened:
                     return self
-                gap = self.minsize - (self._pool_size + len(self._connection_reservations))
-            # If we cannot create the minsize connections here,
-            # the Pool does not meet the minsize requirement.
-            await self._init_connections(gap, strict=True, allow_closed=True)
-            async with self._lock:
-                self._opened = True
-                if self._closed:
-                    self._closed = False
+                startup_waiter = asyncio.get_running_loop().create_future()
+                self._startup_waiter = startup_waiter
+                pending_acquisitions = tuple(self._pending_acquisitions)
+
+            try:
+                await asyncio.gather(*(asyncio.shield(done) for done in pending_acquisitions))
+                async with self._lock:
+                    gap = max(0, self.minsize - self._pool_size)
+                # If we cannot create the minsize connections here,
+                # the Pool does not meet the minsize requirement.
+                await self._init_connections(gap, strict=True, allow_closed=True)
+                async with self._lock:
+                    self._opened = True
+                    if self._closed:
+                        self._closed = False
+            finally:
+                async with self._lock:
+                    if self._startup_waiter is startup_waiter:
+                        self._startup_waiter = None
+                        if not startup_waiter.done():
+                            startup_waiter.set_result(None)
         return self
 
     async def shutdown(self) -> None:
@@ -409,10 +464,14 @@ class Pool:
         async with self._fill_lock:
             async with self._lock:
                 connections = list(self._free_connections) + list(self._acquired_connections)
+                pending_acquisitions = tuple(self._pending_acquisitions)
                 self._connection_reservations.clear()
                 self._free_connections.clear()
                 self._acquired_connections.clear()
                 self._opened = False
                 self._closed = True
 
-            await asyncio.gather(*(conn.close() for conn in connections))
+            await asyncio.gather(
+                *(self._close_connection(conn) for conn in connections),
+                *(asyncio.shield(done) for done in pending_acquisitions),
+            )

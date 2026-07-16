@@ -62,6 +62,23 @@ async def test_slow_health_check_does_not_block_healthy_connection():
 
 
 @pytest.mark.asyncio
+async def test_timed_out_health_check_tries_next_connection():
+    async def timeout():
+        raise asyncio.TimeoutError
+
+    stale = FakeConnection(timeout)
+    healthy = FakeConnection()
+    pool = Pool(minsize=0, maxsize=2)
+    pool._free_connections.extend([stale, healthy])
+
+    assert await use_connection(pool) is healthy
+
+    assert stale.close_calls == 1
+    assert pool.acquired_connections == 0
+    assert pool.free_connections == 1
+
+
+@pytest.mark.asyncio
 async def test_cancelled_health_check_discards_reserved_connection():
     health_check_started = asyncio.Event()
     never_finish = asyncio.Event()
@@ -159,7 +176,87 @@ async def test_cancelled_startup_can_resume_from_created_connections():
 
 
 @pytest.mark.asyncio
-async def test_shutdown_invalidates_pending_connection_creation():
+async def test_startup_waits_for_pending_acquisition():
+    connection_creation_started = asyncio.Event()
+    never_finish = asyncio.Event()
+    replacement = FakeConnection()
+    pool = Pool(minsize=1, maxsize=1)
+    open_calls = 0
+
+    async def open_connection():
+        nonlocal open_calls
+        open_calls += 1
+        if open_calls > 1:
+            return replacement
+        connection_creation_started.set()
+        await never_finish.wait()
+
+    pool._open_connection = open_connection
+    acquisition_task = asyncio.create_task(use_connection(pool))
+    await connection_creation_started.wait()
+    startup_task = asyncio.create_task(pool.startup())
+    await asyncio.sleep(0)
+
+    assert not startup_task.done()
+
+    acquisition_task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await acquisition_task
+    await startup_task
+
+    assert pool.opened
+    assert pool.free_connections == 1
+    assert pool.acquired_connections == 0
+    assert not pool._connection_reservations
+
+
+@pytest.mark.asyncio
+async def test_cancelled_acquisition_restores_minsize():
+    first_connection_acquired = asyncio.Event()
+    release_first_connection = asyncio.Event()
+    second_connection_started = asyncio.Event()
+    never_finish = asyncio.Event()
+    first = FakeConnection()
+    replacement = FakeConnection()
+    pool = Pool(minsize=1, maxsize=2)
+    pool._opened = True
+    pool._free_connections.append(first)
+    open_calls = 0
+
+    async def hold_invalid_connection():
+        async with pool.connection() as connection:
+            first_connection_acquired.set()
+            await release_first_connection.wait()
+            await connection.close()
+
+    async def open_connection():
+        nonlocal open_calls
+        open_calls += 1
+        if open_calls > 1:
+            return replacement
+        second_connection_started.set()
+        await never_finish.wait()
+
+    pool._open_connection = open_connection
+    first_task = asyncio.create_task(hold_invalid_connection())
+    await first_connection_acquired.wait()
+    second_task = asyncio.create_task(use_connection(pool))
+    await second_connection_started.wait()
+
+    release_first_connection.set()
+    await first_task
+    second_task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await second_task
+
+    assert pool.opened
+    assert pool.free_connections == 1
+    assert pool.acquired_connections == 0
+    assert not pool._connection_reservations
+
+
+@pytest.mark.asyncio
+async def test_shutdown_waits_for_pending_connection_creation():
     connection_creation_started = asyncio.Event()
     finish_connection_creation = asyncio.Event()
     connection = FakeConnection()
@@ -174,11 +271,15 @@ async def test_shutdown_invalidates_pending_connection_creation():
     task = asyncio.create_task(use_connection(pool))
     await connection_creation_started.wait()
 
-    await pool.shutdown()
-    finish_connection_creation.set()
+    shutdown_task = asyncio.create_task(pool.shutdown())
+    await asyncio.sleep(0)
 
+    assert not shutdown_task.done()
+
+    finish_connection_creation.set()
     with pytest.raises(AsynchPoolError, match="closed while creating"):
         await task
+    await shutdown_task
 
     assert connection.close_calls == 1
     assert pool.acquired_connections == 0
