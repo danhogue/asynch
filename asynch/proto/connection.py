@@ -8,6 +8,7 @@ from typing import Any, Iterable, Mapping, Optional, Union
 from urllib.parse import urlparse
 
 from asynch.errors import (
+    OperationalError,
     PartiallyConsumedQueryError,
     ServerException,
     UnexpectedPacketFromServerError,
@@ -335,7 +336,7 @@ class Connection:
                 "we believe that the connection is incorrect.",
                 exc_info=e,
             )
-        except (ConnectionError, OSError, RuntimeError) as e:
+        except (ConnectionError, OSError, RuntimeError, OperationalError) as e:
             # If raised RuntimeError with "TCPTransport the handler is closed" - just returning false,
             # because this is a connection loss case
             if isinstance(e, RuntimeError) and "TCPTransport closed=True" not in str(e):

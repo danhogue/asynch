@@ -6,7 +6,7 @@ from contextlib import asynccontextmanager, suppress
 from typing import Optional
 
 from asynch.connection import Connection
-from asynch.errors import AsynchPoolError, OperationalError
+from asynch.errors import AsynchPoolError
 from asynch.proto import constants
 from asynch.proto.models.enums import PoolStatus
 
@@ -32,6 +32,7 @@ class Pool:
         self._sem = asyncio.Semaphore(maxsize)
         self._lock = asyncio.Lock()
         self._fill_lock = asyncio.Lock()
+        self._loop: Optional[asyncio.AbstractEventLoop] = None
         self._connection_reservations: set[object] = set()
         self._pending_acquisitions: set[asyncio.Future] = set()
         self._startup_waiter: Optional[asyncio.Future] = None
@@ -154,13 +155,6 @@ class Pool:
             if not done.done():
                 done.set_result(None)
 
-    async def _restore_minsize(self) -> None:
-        async with self._lock:
-            should_fill = self._opened and not self._closed
-        if should_fill:
-            with suppress(Exception):
-                await self._ensure_minsize_connections(strict=True)
-
     async def _close_connection(self, conn: Connection) -> None:
         with suppress(Exception):
             await conn.close()
@@ -260,7 +254,7 @@ class Pool:
                 self._acquired_connections.append(conn)
 
             try:
-                await conn._refresh()
+                await conn.ping()
                 async with self._lock:
                     acquired = conn in self._acquired_connections
             except asyncio.CancelledError:
@@ -271,7 +265,6 @@ class Pool:
                 OSError,
                 asyncio.TimeoutError,
                 RuntimeError,
-                OperationalError,
             ):
                 await self._discard_acquired_connection(conn)
                 continue
@@ -286,7 +279,6 @@ class Pool:
 
     async def _acquire_connection(self) -> Connection:
         done = await self._begin_acquisition()
-        failed = False
         try:
             if conn := await self._get_fresh_connection():
                 return conn
@@ -310,13 +302,8 @@ class Pool:
 
             await self._close_connection(conn)
             raise AsynchPoolError(f"{self} was closed while creating a connection")
-        except BaseException:
-            failed = True
-            raise
         finally:
             await self._finish_acquisition(done)
-            if failed:
-                await self._restore_minsize()
 
     async def _release_connection(self, conn: Connection) -> None:
         async with self._lock:
@@ -363,6 +350,12 @@ class Pool:
             if gap > 0:
                 await self._init_connections(gap, strict=strict)
 
+    def _ensure_current_loop(self) -> None:
+        running = asyncio.get_running_loop()
+        if self._loop not in (None, running):
+            self._reset_for_new_loop()
+        self._loop = running
+
     def _reset_for_new_loop(self) -> None:
         """Recreate asyncio primitives and discard connections when the event loop changes.
 
@@ -396,9 +389,7 @@ class Pool:
         :rtype: Connection
         """
 
-        running = asyncio.get_running_loop()
-        if getattr(self._lock, "_loop", None) not in (None, running):
-            self._reset_for_new_loop()
+        self._ensure_current_loop()
 
         async with self._sem:
             conn = await self._acquire_connection()
@@ -422,9 +413,7 @@ class Pool:
         :rtype: Pool
         """
 
-        running = asyncio.get_running_loop()
-        if getattr(self._lock, "_loop", None) not in (None, running):
-            self._reset_for_new_loop()
+        self._ensure_current_loop()
 
         async with self._fill_lock:
             async with self._lock:
@@ -460,6 +449,8 @@ class Pool:
         Then it does the same for the acquired connections.
         Then the pool is marked closed.
         """
+
+        self._ensure_current_loop()
 
         async with self._fill_lock:
             async with self._lock:

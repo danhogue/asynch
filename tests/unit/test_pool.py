@@ -1,23 +1,25 @@
 import asyncio
+from unittest.mock import AsyncMock
 
 import pytest
 
+from asynch.connection import Connection
 from asynch.errors import AsynchPoolError
 from asynch.pool import Pool
 
 
 class FakeConnection:
-    def __init__(self, refresh=None):
-        self._refresh_impl = refresh
-        self.refresh_calls = 0
+    def __init__(self, ping=None):
+        self._ping_impl = ping
+        self.ping_calls = 0
         self.close_calls = 0
         self.opened = True
         self.closed = False
 
-    async def _refresh(self):
-        self.refresh_calls += 1
-        if self._refresh_impl:
-            await self._refresh_impl()
+    async def ping(self):
+        self.ping_calls += 1
+        if self._ping_impl:
+            await self._ping_impl()
 
     async def close(self):
         if self.closed:
@@ -76,6 +78,25 @@ async def test_timed_out_health_check_tries_next_connection():
     assert stale.close_calls == 1
     assert pool.acquired_connections == 0
     assert pool.free_connections == 1
+
+
+@pytest.mark.asyncio
+async def test_failed_ping_uses_healthy_connection_without_reconnecting():
+    stale = Connection()
+    stale._opened = True
+    stale._connection.ping = AsyncMock(return_value=False)
+    stale._connection.disconnect = AsyncMock()
+    stale._connection.connect = AsyncMock()
+
+    healthy = Connection()
+    healthy._opened = True
+    healthy._connection.ping = AsyncMock(return_value=True)
+
+    pool = Pool(minsize=0, maxsize=2)
+    pool._free_connections.extend([stale, healthy])
+
+    assert await use_connection(pool) is healthy
+    stale._connection.connect.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -211,48 +232,34 @@ async def test_startup_waits_for_pending_acquisition():
 
 
 @pytest.mark.asyncio
-async def test_cancelled_acquisition_restores_minsize():
-    first_connection_acquired = asyncio.Event()
-    release_first_connection = asyncio.Event()
-    second_connection_started = asyncio.Event()
+async def test_cancelled_acquisition_does_not_wait_for_minsize_refill():
+    health_check_started = asyncio.Event()
     never_finish = asyncio.Event()
-    first = FakeConnection()
     replacement = FakeConnection()
-    pool = Pool(minsize=1, maxsize=2)
+    pool = Pool(minsize=1, maxsize=1)
     pool._opened = True
-    pool._free_connections.append(first)
     open_calls = 0
 
-    async def hold_invalid_connection():
-        async with pool.connection() as connection:
-            first_connection_acquired.set()
-            await release_first_connection.wait()
-            await connection.close()
+    async def stuck_ping():
+        health_check_started.set()
+        await never_finish.wait()
 
     async def open_connection():
         nonlocal open_calls
         open_calls += 1
-        if open_calls > 1:
-            return replacement
-        second_connection_started.set()
-        await never_finish.wait()
+        return replacement
 
+    pool._free_connections.append(FakeConnection(stuck_ping))
     pool._open_connection = open_connection
-    first_task = asyncio.create_task(hold_invalid_connection())
-    await first_connection_acquired.wait()
-    second_task = asyncio.create_task(use_connection(pool))
-    await second_connection_started.wait()
+    task = asyncio.create_task(use_connection(pool))
+    await health_check_started.wait()
+    task.cancel()
 
-    release_first_connection.set()
-    await first_task
-    second_task.cancel()
     with pytest.raises(asyncio.CancelledError):
-        await second_task
+        await asyncio.wait_for(task, timeout=0.1)
 
-    assert pool.opened
-    assert pool.free_connections == 1
-    assert pool.acquired_connections == 0
-    assert not pool._connection_reservations
+    assert open_calls == 0
+    assert await use_connection(pool) is replacement
 
 
 @pytest.mark.asyncio
@@ -349,6 +356,26 @@ async def test_connection_is_not_health_checked_on_release():
 
     assert await use_connection(pool) is connection
 
-    assert connection.refresh_calls == 1
+    assert connection.ping_calls == 1
     assert pool.acquired_connections == 0
     assert pool.free_connections == 1
+
+
+def test_pool_resets_all_primitives_for_new_loop():
+    pool = Pool(minsize=0, maxsize=1)
+
+    async def bind_fill_lock():
+        await pool.startup()
+        await pool._fill_lock.acquire()
+        waiter = asyncio.create_task(pool._fill_lock.acquire())
+        await asyncio.sleep(0)
+        waiter.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await waiter
+        pool._fill_lock.release()
+
+    asyncio.run(bind_fill_lock())
+    old_fill_lock = pool._fill_lock
+    asyncio.run(pool.startup())
+
+    assert pool._fill_lock is not old_fill_lock

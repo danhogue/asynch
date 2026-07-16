@@ -3,6 +3,7 @@ from unittest.mock import AsyncMock, Mock
 
 import pytest
 
+from asynch.errors import OperationalError
 from asynch.proto.connection import Connection
 from asynch.proto.streams.buffered import BufferedWriter
 
@@ -24,6 +25,23 @@ async def test_ping_honors_sync_request_timeout():
 
     assert await asyncio.wait_for(connection.ping(), timeout=1.0) is False
     connection.disconnect.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_force_connect_recovers_from_operational_error():
+    connection = Connection()
+    connection.connected = True
+    connection.reader = Mock()
+    connection.reader.reader.at_eof.return_value = False
+    connection.reader.read_varint = AsyncMock(side_effect=OperationalError("remote closed"))
+    connection.writer = Mock()
+    connection.writer.write_varint = AsyncMock()
+    connection.writer.flush = AsyncMock()
+    connection.connect = AsyncMock()
+
+    await connection.force_connect()
+
+    connection.connect.assert_awaited_once()
 
 
 @pytest.mark.asyncio

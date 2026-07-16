@@ -210,7 +210,6 @@ class Connection:
         try:
             await self.ping()
         except ConnectionError:
-            await self.close()
             await self.connect()
 
     async def rollback(self):
