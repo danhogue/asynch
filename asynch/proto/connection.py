@@ -303,23 +303,29 @@ class Connection:
             ssl_ctx.verify_mode = ssl.VerifyMode.CERT_NONE
         return ssl_ctx
 
+    async def _ping(self) -> bool:
+        if self.reader.reader.at_eof():
+            logger.debug("%s at EOF", self.reader)
+            await self.disconnect()
+            return False
+
+        await self.writer.write_varint(ClientPacket.PING)
+        await self.writer.flush()
+        packet_type = await self.reader.read_varint()
+        while packet_type == ServerPacket.PROGRESS:
+            await self.receive_progress()
+            packet_type = await self.reader.read_varint()
+        if packet_type != ServerPacket.PONG:
+            msg = self.unexpected_packet_message("Pong", packet_type)
+            raise UnexpectedPacketFromServerError(msg)
+        return True
+
     async def ping(self) -> bool:
         try:
-            if self.reader.reader.at_eof():
-                logger.debug("%s at EOF", self.reader)
-                await self.disconnect()
-                return False
-
-            await self.writer.write_varint(ClientPacket.PING)
-            await self.writer.flush()
-            packet_type = await self.reader.read_varint()
-            while packet_type == ServerPacket.PROGRESS:
-                await self.receive_progress()
-                packet_type = await self.reader.read_varint()
-            if packet_type != ServerPacket.PONG:
-                msg = self.unexpected_packet_message("Pong", packet_type)
-                raise UnexpectedPacketFromServerError(msg)
-            return True
+            return await asyncio.wait_for(self._ping(), timeout=self.sync_request_timeout)
+        except asyncio.TimeoutError as e:
+            logger.debug("Ping timed out", exc_info=e)
+            await self.disconnect()
         except AttributeError:
             logger.debug("The connection %s is not open", self)
         except IndexError as e:
@@ -565,12 +571,12 @@ class Connection:
         self.is_query_executing = False
 
     async def disconnect(self):
-        if self.connected:
-            try:
-                await self.writer.close()
-            except ConnectionError as e:
-                logger.debug("Socket closed", exc_info=e)
-
+        try:
+            if self.writer:
+                await self.writer.close(timeout=self.sync_request_timeout)
+        except (ConnectionError, asyncio.TimeoutError) as e:
+            logger.debug("Socket closed", exc_info=e)
+        finally:
             self.reset_state()
             self.connected = False
 
@@ -580,7 +586,16 @@ class Connection:
         logger.debug("Connecting. Database: %s. User: %s", self.database, self.user)
         for host, port in self.hosts:
             logger.debug("Connecting to %s:%s", host, port)
-            return await self._init_connection(host, port)
+            try:
+                return await asyncio.wait_for(
+                    self._init_connection(host, port), timeout=self.connect_timeout
+                )
+            except asyncio.CancelledError:
+                await self.disconnect()
+                raise
+            except Exception:
+                await self.disconnect()
+                raise
 
     async def execute(
         self,

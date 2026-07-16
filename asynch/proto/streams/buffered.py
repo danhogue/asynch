@@ -1,3 +1,4 @@
+import asyncio
 import struct
 from asyncio import StreamReader, StreamWriter
 
@@ -58,11 +59,15 @@ class BufferedWriter:
                 packet = item
             await self.write_bytes(packet.ljust(length, b"\x00"))
 
-    async def close(self) -> None:
+    async def close(self, timeout: float = constants.DBMS_DEFAULT_SYNC_REQUEST_TIMEOUT_SEC) -> None:
         if not self.writer:
             return
         self.writer.close()
-        await self.writer.wait_closed()
+        try:
+            await asyncio.wait_for(self.writer.wait_closed(), timeout=timeout)
+        except (asyncio.CancelledError, asyncio.TimeoutError):
+            self.writer.transport.abort()
+            raise
 
     async def write_int(self, data: int, fmt: str):
         fmt = "<" + fmt
