@@ -31,6 +31,11 @@ class Pool:
         self._connection_kwargs = kwargs
         self._sem = asyncio.Semaphore(maxsize)
         self._lock = asyncio.Lock()
+        self._fill_lock = asyncio.Lock()
+        self._loop: Optional[asyncio.AbstractEventLoop] = None
+        self._connection_reservations: set[object] = set()
+        self._pending_acquisitions: set[asyncio.Future] = set()
+        self._startup_waiter: Optional[asyncio.Future] = None
         self._acquired_connections: deque[Connection] = deque(maxlen=maxsize)
         self._free_connections: deque[Connection] = deque(maxlen=maxsize)
         self._opened: bool = False
@@ -132,78 +137,200 @@ class Pool:
     def minsize(self) -> int:
         return self._minsize
 
-    async def _create_connection(self) -> None:
-        if self._pool_size == self._maxsize:
-            raise AsynchPoolError(f"{self} is already full")
-        if self._pool_size > self._maxsize:
-            raise AsynchPoolError(f"{self} is overburden")
+    async def _begin_acquisition(self) -> asyncio.Future:
+        while True:
+            async with self._lock:
+                if self._closed:
+                    raise AsynchPoolError(f"{self} is closed")
+                if self._startup_waiter is None:
+                    done = asyncio.get_running_loop().create_future()
+                    self._pending_acquisitions.add(done)
+                    return done
+                startup_waiter = self._startup_waiter
+            await asyncio.shield(startup_waiter)
 
+    async def _finish_acquisition(self, done: asyncio.Future) -> None:
+        async with self._lock:
+            self._pending_acquisitions.discard(done)
+            if not done.done():
+                done.set_result(None)
+
+    async def _close_connection(self, conn: Connection) -> None:
+        with suppress(Exception):
+            await conn.close()
+
+    async def _open_connection(self) -> Connection:
         conn = Connection(**self._connection_kwargs)
-        await conn.connect()
-
         try:
+            await conn.connect()
             await conn.ping()
-            self._free_connections.append(conn)
-        except ConnectionError as e:
+        except asyncio.CancelledError:
+            await self._close_connection(conn)
+            raise
+        except Exception as e:
+            await self._close_connection(conn)
             msg = f"failed to create a {conn} for {self}"
             raise AsynchPoolError(msg) from e
+        return conn
+
+    async def _reserve_connection_creations(
+        self, n: int, *, allow_closed: bool = False
+    ) -> list[object]:
+        async with self._lock:
+            if self._closed and not allow_closed:
+                raise AsynchPoolError(f"{self} is closed")
+            size = self._pool_size + len(self._connection_reservations)
+            if size + n > self._maxsize:
+                msg = (
+                    f"{self} has the {size} connections or pending connections, "
+                    f"adding {n} will exceed its maxsize ({self.maxsize})"
+                )
+                raise AsynchPoolError(msg)
+            reservations = [object() for _ in range(n)]
+            self._connection_reservations.update(reservations)
+            return reservations
+
+    async def _cancel_connection_creation(
+        self, reservation: object, conn: Optional[Connection] = None
+    ) -> None:
+        async with self._lock:
+            self._connection_reservations.discard(reservation)
+            if conn is not None:
+                with suppress(ValueError):
+                    self._free_connections.remove(conn)
+                with suppress(ValueError):
+                    self._acquired_connections.remove(conn)
+
+    async def _store_connection(
+        self, conn: Connection, reservation: object, connections: deque[Connection]
+    ) -> bool:
+        async with self._lock:
+            if reservation not in self._connection_reservations:
+                return False
+            self._connection_reservations.remove(reservation)
+            connections.append(conn)
+            return True
+
+    async def _create_connection(self, reservation: Optional[object] = None) -> None:
+        if reservation is None:
+            reservation = (await self._reserve_connection_creations(1))[0]
+
+        conn = None
+        try:
+            conn = await self._open_connection()
+            if await self._store_connection(conn, reservation, self._free_connections):
+                return
+        except asyncio.CancelledError:
+            await self._cancel_connection_creation(reservation, conn)
+            if conn:
+                await self._close_connection(conn)
+            raise
+        except Exception:
+            await self._cancel_connection_creation(reservation, conn)
+            if conn:
+                await self._close_connection(conn)
+            raise
+
+        await self._close_connection(conn)
+        raise AsynchPoolError(f"{self} was closed while creating a connection")
 
     def _pop_connection(self) -> Connection:
         if not self._free_connections:
             raise AsynchPoolError(f"no free connection in {self}")
         return self._free_connections.popleft()
 
+    async def _discard_acquired_connection(self, conn: Connection) -> None:
+        async with self._lock:
+            with suppress(ValueError):
+                self._acquired_connections.remove(conn)
+        await self._close_connection(conn)
+
     async def _get_fresh_connection(self) -> Optional[Connection]:
-        while self._free_connections:
-            conn = self._pop_connection()
-            # Suppress ConnectionError (stale/dead connection) and RuntimeError
-            # (connection's asyncio StreamReader is bound to a different event
-            # loop — happens when the same Pool is reused across tests with
-            # per-test event loops).  In both cases, discard and try the next.
-            with suppress(ConnectionError, RuntimeError):
-                await conn._refresh()
+        while True:
+            async with self._lock:
+                if not self._free_connections:
+                    return None
+                conn = self._pop_connection()
+                self._acquired_connections.append(conn)
+
+            try:
+                await conn.ping()
+                async with self._lock:
+                    acquired = conn in self._acquired_connections
+            except asyncio.CancelledError:
+                await self._discard_acquired_connection(conn)
+                raise
+            except (
+                ConnectionError,
+                OSError,
+                asyncio.TimeoutError,
+                RuntimeError,
+            ):
+                await self._discard_acquired_connection(conn)
+                continue
+            except Exception:
+                await self._discard_acquired_connection(conn)
+                raise
+
+            if acquired:
                 return conn
-        return None
+            await self._close_connection(conn)
+            raise AsynchPoolError(f"{self} was closed while acquiring a connection")
 
     async def _acquire_connection(self) -> Connection:
-        if conn := await self._get_fresh_connection():
-            self._acquired_connections.append(conn)
-            return conn
+        done = await self._begin_acquisition()
+        try:
+            if conn := await self._get_fresh_connection():
+                return conn
 
-        await self._create_connection()
-        conn = self._pop_connection()
-        self._acquired_connections.append(conn)
-        return conn
+            reservation = (await self._reserve_connection_creations(1))[0]
+            conn = None
+            try:
+                conn = await self._open_connection()
+                if await self._store_connection(conn, reservation, self._acquired_connections):
+                    return conn
+            except asyncio.CancelledError:
+                await self._cancel_connection_creation(reservation, conn)
+                if conn:
+                    await self._close_connection(conn)
+                raise
+            except Exception:
+                await self._cancel_connection_creation(reservation, conn)
+                if conn:
+                    await self._close_connection(conn)
+                raise
+
+            await self._close_connection(conn)
+            raise AsynchPoolError(f"{self} was closed while creating a connection")
+        finally:
+            await self._finish_acquisition(done)
 
     async def _release_connection(self, conn: Connection) -> None:
-        if conn not in self._acquired_connections:
-            raise AsynchPoolError(f"the connection {conn} does not belong to {self}")
+        async with self._lock:
+            if conn not in self._acquired_connections:
+                raise AsynchPoolError(f"the connection {conn} does not belong to {self}")
 
-        self._acquired_connections.remove(conn)
-        try:
-            await conn._refresh()
-        except ConnectionError as e:
-            msg = f"the {conn} is invalidated"
-            raise AsynchPoolError(msg) from e
+            self._acquired_connections.remove(conn)
+            if conn.opened and not conn.closed:
+                self._free_connections.append(conn)
+                return
 
-        self._free_connections.append(conn)
+        raise AsynchPoolError(f"the {conn} is invalidated")
 
-    async def _init_connections(self, n: int, *, strict: bool = False) -> None:
+    async def _init_connections(
+        self, n: int, *, strict: bool = False, allow_closed: bool = False
+    ) -> None:
         if n < 0:
             msg = f"cannot create a negative number ({n}) of connections for {self}"
             raise ValueError(msg)
-        if (self._pool_size + n) > self.maxsize:
-            msg = (
-                f"{self} has the {self._pool_size} connections, "
-                f"adding {n} will exceed its maxsize ({self.maxsize})"
-            )
-            raise AsynchPoolError(msg)
         if not n:
             return
 
+        reservations = await self._reserve_connection_creations(n, allow_closed=allow_closed)
         # it is possible that the `_create_connection` may not create `n` connections
         tasks: list[asyncio.Task] = [
-            asyncio.create_task(self._create_connection()) for _ in range(n)
+            asyncio.create_task(self._create_connection(reservation))
+            for reservation in reservations
         ]
         # that is why possible exceptions from the `_create_connection` are also gathered
         if strict and any(
@@ -215,8 +342,19 @@ class Pool:
             raise AsynchPoolError(msg)
 
     async def _ensure_minsize_connections(self, *, strict: bool = False) -> None:
-        if (gap := self.minsize - self._pool_size) > 0:
-            await self._init_connections(gap, strict=strict)
+        async with self._fill_lock:
+            async with self._lock:
+                if self._closed:
+                    return
+                gap = self.minsize - (self._pool_size + len(self._connection_reservations))
+            if gap > 0:
+                await self._init_connections(gap, strict=strict)
+
+    def _ensure_current_loop(self) -> None:
+        running = asyncio.get_running_loop()
+        if self._loop not in (None, running):
+            self._reset_for_new_loop()
+        self._loop = running
 
     def _reset_for_new_loop(self) -> None:
         """Recreate asyncio primitives and discard connections when the event loop changes.
@@ -229,6 +367,10 @@ class Pool:
         """
         self._sem = asyncio.Semaphore(self._maxsize)
         self._lock = asyncio.Lock()
+        self._fill_lock = asyncio.Lock()
+        self._connection_reservations.clear()
+        self._pending_acquisitions.clear()
+        self._startup_waiter = None
         self._free_connections.clear()
         self._acquired_connections.clear()
         self._opened = False
@@ -247,22 +389,18 @@ class Pool:
         :rtype: Connection
         """
 
-        running = asyncio.get_running_loop()
-        if getattr(self._lock, "_loop", None) not in (None, running):
-            self._reset_for_new_loop()
+        self._ensure_current_loop()
 
         async with self._sem:
-            async with self._lock:
-                conn = await self._acquire_connection()
+            conn = await self._acquire_connection()
             try:
                 yield conn
             finally:
-                async with self._lock:
-                    try:
-                        await self._release_connection(conn)
-                    except AsynchPoolError as e:
-                        logger.warning(e)
-                    await self._ensure_minsize_connections(strict=True)
+                try:
+                    await self._release_connection(conn)
+                except AsynchPoolError as e:
+                    logger.warning(e)
+                await self._ensure_minsize_connections(strict=True)
 
     async def startup(self) -> "Pool":
         """Initialise the pool.
@@ -275,19 +413,33 @@ class Pool:
         :rtype: Pool
         """
 
-        running = asyncio.get_running_loop()
-        if getattr(self._lock, "_loop", None) not in (None, running):
-            self._reset_for_new_loop()
+        self._ensure_current_loop()
 
-        async with self._lock:
-            if self._opened:
-                return self
-            # If we cannot create the minsize connections here,
-            # the Pool does not meet the minsize requirement.
-            await self._init_connections(self.minsize, strict=True)
-            self._opened = True
-            if self._closed:
-                self._closed = False
+        async with self._fill_lock:
+            async with self._lock:
+                if self._opened:
+                    return self
+                startup_waiter = asyncio.get_running_loop().create_future()
+                self._startup_waiter = startup_waiter
+                pending_acquisitions = tuple(self._pending_acquisitions)
+
+            try:
+                await asyncio.gather(*(asyncio.shield(done) for done in pending_acquisitions))
+                async with self._lock:
+                    gap = max(0, self.minsize - self._pool_size)
+                # If we cannot create the minsize connections here,
+                # the Pool does not meet the minsize requirement.
+                await self._init_connections(gap, strict=True, allow_closed=True)
+                async with self._lock:
+                    self._opened = True
+                    if self._closed:
+                        self._closed = False
+            finally:
+                async with self._lock:
+                    if self._startup_waiter is startup_waiter:
+                        self._startup_waiter = None
+                        if not startup_waiter.done():
+                            startup_waiter.set_result(None)
         return self
 
     async def shutdown(self) -> None:
@@ -298,12 +450,19 @@ class Pool:
         Then the pool is marked closed.
         """
 
-        async with self._lock:
-            while self._free_connections:
-                conn = self._free_connections.popleft()
-                await conn.close()
-            while self._acquired_connections:
-                conn = self._acquired_connections.popleft()
-                await conn.close()
-            self._opened = False
-            self._closed = True
+        self._ensure_current_loop()
+
+        async with self._fill_lock:
+            async with self._lock:
+                connections = list(self._free_connections) + list(self._acquired_connections)
+                pending_acquisitions = tuple(self._pending_acquisitions)
+                self._connection_reservations.clear()
+                self._free_connections.clear()
+                self._acquired_connections.clear()
+                self._opened = False
+                self._closed = True
+
+            await asyncio.gather(
+                *(self._close_connection(conn) for conn in connections),
+                *(asyncio.shield(done) for done in pending_acquisitions),
+            )

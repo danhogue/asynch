@@ -132,10 +132,12 @@ class Connection:
 
         if self._closed:
             return
-        if self._opened:
-            await self._connection.disconnect()
-        self._opened = False
-        self._closed = True
+        try:
+            if self._opened:
+                await self._connection.disconnect()
+        finally:
+            self._opened = False
+            self._closed = True
 
     async def commit(self):
         """Commit any pending transaction.
